@@ -2,7 +2,6 @@
 # -*- coding: utf-8 -*-
 
 """
-Created on Mon Nov 15 17:21:25 2021
 
 @author: Conor M. Artman
 """
@@ -20,28 +19,27 @@ Created on Mon Nov 15 17:21:25 2021
 
 import numpy as np
 #import os 
-#import pandas as pd
+import pandas as pd
 import matplotlib.pyplot as plt
 #import operator
 #import torch
 #import os
 #import argparse
-import tqdm #TODO: implement a progress bar for simulation runs 
+import tqdm
 import random 
 #import sys
 
+#=========================================#
 #print('Max size is {}'.format(sys.maxsize))
+#=========================================#
 
-horizon = 1000
-epochs = 1
-N = 100
-B = 20
+horizon = 300
+epochs = 30
+N = 50
+B = 40
+mprop = 0.5
+#=========================================#
 
-#IDEA: shouldn't our objective be to min spread of reward earlier on, or at least balanced with, long term cum reward?
-
-#TODO: how is budget incorporated right now for random and other polciies? What summaries to cinlude for MC sim?
-
-#TODO: for time, maybe WIBQL, Fu, random, and myopic (sets a nice gradient of algs )
 
 class CirculantDynamics:
     
@@ -50,7 +48,8 @@ class CirculantDynamics:
                  T = horizon, epsilon = .1, 
                  N = N,
                  seed = 0,
-                 budget = B):
+                 budget = B,
+                 mis = mprop):
         
         random.seed(seed)
         if trans_mat == None:
@@ -61,12 +60,19 @@ class CirculantDynamics:
         self.epsilon = epsilon
         self.policies = policies
         self.T = int(T)
-        self.N =int( N)
+        self.N =int(N)
         self.R = {0: -1, 1: 0, 2: 0, 3: 1}
         self.policy_type = None
         self.B = int(budget )
         self.ab_count = np.zeros(self.N*4*2).reshape(self.N,4,2).astype(int)
+        self.mR = {0: 1, 1: -1, 2: 0, 3: 0}
+        self.mArms = np.array(range(self.N)).astype(int)
         
+        if mis > 0:
+            #Choose indices of mis-specified arms proportional to mis probability 
+            #print(np.arange(self.N))
+            self.mArms = np.random.choice(np.arange(self.N), size = int(np.floor(mis*self.N)))
+            
         if self.policies is None:
             
             self.policy_type = 'all'
@@ -104,6 +110,7 @@ class CirculantDynamics:
             self.lambdas = None
             
         if self.policies == 'fu':
+            
             lamRange = np.linspace(-1.25, 1.25, num = 10)
             
             self.policies = { 'fu': self.fu_update}
@@ -124,18 +131,18 @@ class CirculantDynamics:
             self.avg_rewards = {'ab': np.zeros(self.T)}
             
             self.lambdas = {'ab': np.zeros(self.N*4).reshape(self.N,4)}
-            
+            self.lamseries = np.zeros(4*self.T).reshape(4,self.T)
             #Initialize Q table as AB describe 
             init_r = np.random.choice([-1,0,0,1], size=self.N*4*4*2).reshape(self.N,4,4,2)
             self.Q = {'ab': init_r}
             
             
-    def run(self):
-        init_active = np.random.choice(range(self.N), size=self.B + 2)
+    def run(self, pol_name):
+        init_active = np.random.choice(range(self.N), size=self.B+3)
         init = np.zeros(self.N)
         init[init_active] += 1 
         
-        init_state = {'ab': init}
+        init_state = {pol_name: init}
         #set initial arm state
         
         for t in range(self.T):
@@ -148,12 +155,9 @@ class CirculantDynamics:
             
             next_states = self.step(t, self.arm_states)
         
-        #Do a summary
 
-        #Return the summary 
-
-        return self.avg_rewards
-    
+        return self.avg_rewards #, self.lamseries if 'ab'
+     
     def step(self, t, states):
 
         next_states = {}
@@ -170,8 +174,6 @@ class CirculantDynamics:
                     gamma = .5
                 explore_outcome = bool(np.random.binomial(1, p = gamma))
                 
-                #TODO: adjust this for either policy to work 
-                
                 if explore_outcome:
                     actions = self.chooseActions(pol_name, states[pol_name])
                     np.where((actions==0)|(actions==1), actions^1, actions)
@@ -182,6 +184,8 @@ class CirculantDynamics:
                 
                 explore_outcome = bool(np.random.binomial(1, p = self.epsilon))
                 actions = self.chooseActions(pol_name, states[pol_name], explore=explore_outcome)
+            else:
+                actions = self.chooseActions(pol_name, states[pol_name])
 
             rewards = self.getRewards(states[pol_name])
             next_states[pol_name] = self.getNextStates(actions, states[pol_name])
@@ -189,7 +193,7 @@ class CirculantDynamics:
             if pol_name == 'random':
                 self.updateRewards(t, pol_name, rewards)
                 
-            #if pol_name == 'fu':
+            
             else:
                 
                 self.updateRewards(t, pol_name, rewards)
@@ -210,11 +214,7 @@ class CirculantDynamics:
         currentStates = currentStates.astype(int)
         #Choose active arms according to Whittle indices
         actions = np.zeros(self.N).astype(int)
-        
-        #Based on:
-        #numbers = np.array([1, 3, 2, 4])    
-        #n = 2
-        #indices = (-numbers).argsort()[:n], returns 3 and 1
+
         
         if pol_name == 'random':
             
@@ -228,18 +228,15 @@ class CirculantDynamics:
             actions = np.zeros(self.N)
             actions[active_choices] += 1 
             
-        else:
+        if pol_name == 'fu':
             active_arms = self.lambdas[pol_name]
             activation_indices = (-active_arms).argsort()[:self.B]
             actions[activation_indices] += 1
         
         return actions
 
-    def wiql_update(self):
-        
-        return
-    
-    def ab_update(self, t, currentStates, nextStates, rewards, currentActions,  updateQ = False, updateLam = False, explore = False, average = True):
+
+    def ab_update(self, t, currentStates, nextStates, rewards, currentActions,  updateQ = False, updateLam = False, explore = False, average = True, mis = False):
         currentActions = currentActions.astype(int)
         currentStates = currentStates.astype(int)
         nextStates = nextStates.astype(int)
@@ -286,7 +283,7 @@ class CirculantDynamics:
                         Q0 = self.Q['ab'][arm, state, state, 0]
                         
                         self.lambdas['ab'][arm, state] = update_multiplier*(Q1 - Q0)
-                        
+                        self.lamseries[state, t] = self.lambdas['ab'][:,state].mean()
                         #self.lambdas['ab'][arm, state] = min(lambda_ub, lam[arm, state])
                         #self.lambdas['ab'][arm, state] = max(lambda_lb, lam[arm, state])
             
@@ -304,7 +301,7 @@ class CirculantDynamics:
         
         return
     
-    def fu_update(self, t, currentStates, nextStates, rewards, currentActions,  updateQ = False, updateLam = False, explore = False):
+    def fu_update(self, t, currentStates, nextStates, rewards, currentActions,  updateQ = False, updateLam = False, explore = False, mis = False):
         nextStates = nextStates.astype(int)
         beta = .99
         
@@ -382,7 +379,13 @@ class CirculantDynamics:
 
         rewards = np.zeros(self.N)
         for arm in range(self.N):
-            rewards[arm] += self.R[currentStates[arm]]
+            
+            # if mis-specified, return mis-specified reward
+            if arm in self.mArms:
+                rewards[arm] = self.mR[currentStates[arm]]
+            
+            else:
+                rewards[arm] += self.R[currentStates[arm]]
 
 
         return rewards
@@ -395,21 +398,36 @@ class CirculantDynamics:
         self.avg_rewards[pol_name][t] = np.mean(currentRewards)
 
         return
-    
 
-
-def analyze(sim):
-    
-    return 
 
 if __name__=='__main__':
-    sim = CirculantDynamics(policies = 'ab')
-    # print(sim.P[0][3,2])
-    #print(sim.P[1])
-    # print(4**4)
-    y=sim.run()
-    x = np.linspace(0,1000,num=1000)
-    plt.plot(x, y['ab'])
+    
+    
+    rdata = []
+    ldata = []
+    
+    for e in range(epochs):
+        sim = CirculantDynamics(policies = 'random')
+        #y, lam = sim.run()
+        y= sim.run()
+        
+        rdata.append(y['random'])
+        #ldata.append(lam)
+        
+    rdata = np.array(rdata)
+    #ldata = np.array(ldata)
+    
+    np.save('/Users/kerner/Desktop/written_prelim/rand_r_m50_b8_10e_50n.npy', rdata)
+    #np.save('/Users/kerner/Desktop/written_prelim/fu_l_m0_b2_10e_50n.npy', ldata)
+    
+    # rdata = np.load('/Users/kerner/Desktop/written_prelim/ab_r_m25_b2_10e_50n.npy')
+    # print(rdata.shape)
+    
+    # x = np.linspace(0,300,num=300)
+    # y = rdata[0,:]
+    # plt.plot(x,y)
+    
+
     
     
     
